@@ -4,18 +4,15 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::Context;
-use arc_swap::ArcSwapOption;
-use atomic::Atomic;
+use anyhow::{Context, Result};
 use clap::Parser;
-use hdrhistogram::Histogram;
 use indexmap::IndexMap;
 use livesplit_auto_splitting::{
     settings, time, wasi_path, AutoSplitter, CompiledAutoSplitter, Config, ExecutionGuard,
@@ -30,46 +27,22 @@ struct Args {
     wasm_path: PathBuf,
 }
 
-fn main() {
-    let time_zone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-
+fn main() -> Result<()> {
     let args = Args::parse();
 
-    let shared_state = Arc::new(SharedState {
-        auto_splitter: ArcSwapOption::new(None),
-        memory_usage: AtomicUsize::new(0),
-        handles: AtomicU64::new(0),
-        tick_rate: Mutex::new(std::time::Duration::ZERO),
-        slowest_tick: Mutex::new(std::time::Duration::ZERO),
-        avg_tick_secs: Atomic::new(0.0),
-        tick_times: Mutex::new(Histogram::new(1).unwrap()),
-    });
+    let time_zone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     let timer = DebuggerTimer::new(time_zone);
+
+    let state = AppState::new(args.wasm_path, timer.clone())?;
+    let shared_state = Arc::clone(&state.shared_state);
 
     thread::Builder::new()
         .name("Auto Splitter Thread".into())
         .spawn({
-            let timer = timer.clone();
             let shared_state = shared_state.clone();
-            move || runtime_thread(shared_state, timer.clone())
+            move || runtime_thread(shared_state, timer)
         })
         .unwrap();
-
-    let mut options = eframe::NativeOptions::default();
-    options.viewport.inner_size = Some((1250.0, 800.0).into());
-
-    let optimize = !args.debug;
-    let mut state = AppState {
-        path: None,
-        script_path: None,
-        module_modified_time: None,
-        module: None,
-        shared_state,
-        timer,
-        runtime: build_runtime(optimize),
-    };
-
-    state.load(Load::File(args.wasm_path));
 
     // let settings_map = self
     //     .state
@@ -87,24 +60,20 @@ fn main() {
     // if runtime.set_settings_map_if_unchanged(&old, new) {
     //     break;
     // }
+
+    Ok(())
 }
 
 struct SharedState {
-    auto_splitter: ArcSwapOption<AutoSplitter<DebuggerTimer>>,
+    auto_splitter: AutoSplitter<DebuggerTimer>,
     tick_rate: Mutex<std::time::Duration>,
-    slowest_tick: Mutex<std::time::Duration>,
     memory_usage: AtomicUsize,
-    handles: AtomicU64,
-    avg_tick_secs: Atomic<f64>,
-    tick_times: Mutex<Histogram<u64>>,
 }
 
 impl SharedState {
     fn kill_auto_splitter_if_it_doesnt_react(&self) {
-        let Some(auto_splitter) = &*self.auto_splitter.load() else {
-            return;
-        };
-        if Self::try_lock(auto_splitter).is_none() {
+        let auto_splitter = &self.auto_splitter;
+        if Self::try_lock(&self.auto_splitter).is_none() {
             auto_splitter.interrupt_handle().interrupt();
         }
     }
@@ -126,63 +95,38 @@ impl SharedState {
 fn runtime_thread(shared_state: Arc<SharedState>, timer: DebuggerTimer) {
     let mut next_tick = Instant::now();
     loop {
-        let tick_rate = {
-            if let Some(auto_splitter) = &*shared_state.auto_splitter.load() {
-                let mut auto_splitter_lock = auto_splitter.lock();
-                let now = Instant::now();
-                let res = auto_splitter_lock.update();
-                let time_of_tick = now.elapsed();
-                let memory_usage = auto_splitter_lock.memory().len();
-                // {
-                //     let mut processes = shared_state.processes.lock().unwrap();
-                //     processes.clear();
-                //     auto_splitter_lock.attached_processes().for_each(|process| {
-                //         use std::fmt::Write;
-                //         let element = processes.push();
-                //         let _ = write!(element.pid, "{}", process.pid());
-                //         element
-                //             .path
-                //             .push_str(process.path().unwrap_or("Unnamed Process"));
-                //     });
-                // }
-                let handles = auto_splitter_lock.handles();
-                drop(auto_splitter_lock);
+        let auto_splitter = &shared_state.auto_splitter;
+        let mut auto_splitter_lock = auto_splitter.lock();
+        // does the actual work
+        let res = auto_splitter_lock.update();
+        let memory_usage = auto_splitter_lock.memory().len();
 
-                shared_state
-                    .memory_usage
-                    .store(memory_usage, atomic::Ordering::Relaxed);
-                shared_state
-                    .handles
-                    .store(handles, atomic::Ordering::Relaxed);
+        // {
+        //     let mut processes = shared_state.processes.lock().unwrap();
+        //     processes.clear();
+        //     auto_splitter_lock.attached_processes().for_each(|process| {
+        //         use std::fmt::Write;
+        //         let element = processes.push();
+        //         let _ = write!(element.pid, "{}", process.pid());
+        //         element
+        //             .path
+        //             .push_str(process.path().unwrap_or("Unnamed Process"));
+        //     });
+        // }
 
-                {
-                    let mut slowest_tick = shared_state.slowest_tick.lock().unwrap();
-                    if time_of_tick > *slowest_tick {
-                        *slowest_tick = time_of_tick;
-                    }
-                }
+        drop(auto_splitter_lock);
 
-                *shared_state.tick_rate.lock().unwrap() = auto_splitter.tick_rate();
-                *shared_state.tick_times.lock().unwrap() += time_of_tick.as_nanos() as u64;
-                shared_state.avg_tick_secs.store(
-                    0.999 * shared_state.avg_tick_secs.load(atomic::Ordering::Relaxed)
-                        + 0.001 * time_of_tick.as_secs_f64(),
-                    atomic::Ordering::Relaxed,
-                );
-                if let Err(e) = res {
-                    timer.0.write().unwrap().log(
-                        format!("{:?}", e.context("Failed executing the auto splitter.")).into(),
-                        LogType::Runtime(LogLevel::Error),
-                    )
-                };
-                auto_splitter.tick_rate()
-            } else {
-                // shared_state.processes.lock().unwrap().clear();
+        shared_state
+            .memory_usage
+            .store(memory_usage, Ordering::Relaxed);
 
-                // Tick at 10 Hz when no runtime is loaded.
-                std::time::Duration::from_secs(1) / 10
-            }
+        let tick_rate = auto_splitter.tick_rate();
+        *shared_state.tick_rate.lock().unwrap() = tick_rate;
+
+        if let Err(e) = res {
+            eprintln!("{:?}", e.context("Failed executing the auto splitter."));
         };
+
         next_tick += tick_rate;
 
         let now = Instant::now();
@@ -199,10 +143,9 @@ fn runtime_thread(shared_state: Arc<SharedState>, timer: DebuggerTimer) {
 }
 
 struct AppState {
-    path: Option<PathBuf>,
-    script_path: Option<PathBuf>,
+    path: PathBuf,
     module_modified_time: Option<SystemTime>,
-    module: Option<CompiledAutoSplitter>,
+    module: CompiledAutoSplitter,
     shared_state: Arc<SharedState>,
     timer: DebuggerTimer,
     runtime: livesplit_auto_splitting::Runtime,
@@ -213,90 +156,66 @@ enum Load {
 }
 
 impl AppState {
-    fn load(&mut self, load: Load) {
-        let settings_map = if let Load::File(path) = &load {
-            self.path = Some(path.clone());
-            None
-        } else {
-            self.shared_state
-                .auto_splitter
-                .load()
-                .as_ref()
-                .map(|r| r.settings_map())
-        };
+    fn new(path: PathBuf, timer: DebuggerTimer) -> anyhow::Result<Self> {
+        // let optimize = !args.debug;
+        // let mut state = AppState {
+        //     path: None,
+        //     script_path: None,
+        //     module_modified_time: None,
+        //     module: None,
+        //     shared_state,
+        //     timer,
+        //     runtime: build_runtime(optimize),
+        // };
+        //
+        // state.load(Load::File(args.wasm_path));
 
-        let mut succeeded = true;
+        let settings_map = None;
+        // let settings_map = if let Load::File(path) = &load {
+        // } else {
+        //     self.shared_state
+        //         .auto_splitter
+        //         .load()
+        //         .as_ref()
+        //         .map(|r| r.settings_map())
+        // };
 
-        if let (Load::File(_), Some(path)) = (&load, &self.path) {
-            self.module = match fs::read(path)
-                .context("Failed loading the auto splitter from the file system.")
-                .and_then(|data| {
-                    self.runtime
-                        .compile(&data)
-                        .context("Failed loading the auto splitter.")
-                }) {
-                Ok(module) => Some(module),
-                Err(e) => {
-                    succeeded = false;
-                    self.timer
-                        .0
-                        .write()
-                        .unwrap()
-                        .log(format!("{e:?}").into(), LogType::Runtime(LogLevel::Error));
-                    None
-                }
-            };
-            self.module_modified_time = fs::metadata(path).ok().and_then(|m| m.modified().ok());
-        }
+        let runtime = build_runtime(true);
 
-        let new_auto_splitter = if let Some(module) = &self.module {
-            match module
-                .instantiate(
-                    self.timer.clone(),
-                    settings_map,
-                    self.script_path.as_deref(),
-                )
-                .context("Failed starting the auto splitter.")
-            {
-                Ok(r) => Some(Arc::new(r)),
-                Err(e) => {
-                    succeeded = false;
-                    self.timer
-                        .0
-                        .write()
-                        .unwrap()
-                        .log(format!("{e:?}").into(), LogType::Runtime(LogLevel::Error));
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let module = fs::read(&path)
+            .context("Failed loading the auto splitter from the file system.")
+            .and_then(|data| {
+                runtime
+                    .compile(&data)
+                    .context("Failed loading the auto splitter.")
+            })?;
+        let module_modified_time = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
 
-        self.shared_state.kill_auto_splitter_if_it_doesnt_react();
-        self.shared_state.auto_splitter.store(new_auto_splitter);
+        let new_auto_splitter = module
+            .instantiate(timer.clone(), settings_map, None)
+            .context("Failed starting the auto splitter.")?;
 
-        *self.shared_state.slowest_tick.lock().unwrap() = std::time::Duration::ZERO;
-        self.shared_state
-            .avg_tick_secs
-            .store(0.0, atomic::Ordering::Relaxed);
-        self.shared_state.tick_times.lock().unwrap().clear();
+        let shared_state = Arc::new(SharedState {
+            auto_splitter: new_auto_splitter,
+            memory_usage: AtomicUsize::new(0),
+            tick_rate: Mutex::new(std::time::Duration::ZERO),
+        });
 
-        let mut timer = self.timer.0.write().unwrap();
-        if let Load::File(_) = &load {
-            timer.clear();
-        }
-        timer.variables.clear();
+        let mut inner_timer = timer.0.write().unwrap();
+        // if let Load::File(_) = &load {
+        inner_timer.clear();
+        // }
+        inner_timer.variables.clear();
+        drop(inner_timer);
 
-        if succeeded {
-            timer.log(
-                match load {
-                    Load::File(_) => "Auto splitter loaded.",
-                }
-                .into(),
-                LogType::Runtime(LogLevel::Info),
-            );
-        }
+        Ok(AppState {
+            path,
+            module_modified_time,
+            module,
+            shared_state,
+            timer,
+            runtime,
+        })
     }
 }
 
