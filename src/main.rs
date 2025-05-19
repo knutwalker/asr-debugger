@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -19,6 +20,7 @@ use livesplit_auto_splitting::{
     LogLevel, Runtime, Timer, TimerState,
 };
 use time::UtcOffset;
+use tungstenite::{Message, Utf8Bytes, WebSocket};
 
 #[derive(Parser)]
 struct Args {
@@ -30,19 +32,69 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let time_zone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    let timer = DebuggerTimer::new(time_zone);
+    let server = TcpListener::bind("127.0.0.1:9001").unwrap();
+    for stream in server.incoming() {
+        let stream = stream?;
+        let path = args.wasm_path.clone();
+        std::thread::spawn(move || -> Result<()> {
+            let mut websocket = tungstenite::accept(stream)?;
 
-    let state = AppState::new(args.wasm_path, timer.clone())?;
-    let shared_state = Arc::clone(&state.shared_state);
+            websocket.send(Messages::get_current_state())?;
+            let state = websocket.read()?;
+            eprintln!("state = {state:?}");
 
-    thread::Builder::new()
-        .name("Auto Splitter Thread".into())
-        .spawn({
-            let shared_state = shared_state.clone();
-            move || runtime_thread(shared_state, timer)
-        })
-        .unwrap();
+            // let time_zone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+            let timer = WebsocketTimer(websocket);
+
+            let state = AppState::new(path, timer)?;
+            let shared_state = Arc::clone(&state.shared_state);
+
+            runtime_thread(shared_state);
+
+            // thread::Builder::new()
+            //     .name("Auto Splitter Thread".into())
+            //     .spawn({
+            //         let shared_state = shared_state.clone();
+            //         move || runtime_thread(shared_state, timer)
+            //     })
+            //     .unwrap();
+
+            // loop {
+            //     let msg = websocket.read().unwrap();
+            //     match msg {
+            //         Message::Text(msg) => {
+            //             // let msg =
+            //             //     serde_json::from_str::<livesplit_core::event::Event>(msg.as_str())
+            //             //         .unwrap();
+            //             eprintln!("received: {:?}", msg.as_str());
+            //         }
+            //         Message::Binary(bytes) => todo!(),
+            //         Message::Ping(bytes) => {
+            //             websocket.send(Message::Pong(bytes)).unwrap();
+            //         }
+            //         Message::Pong(bytes) => todo!(),
+            //         Message::Close(close_frame) => todo!(),
+            //         Message::Frame(frame) => todo!(),
+            //     }
+            // }
+
+            Ok(())
+        });
+    }
+
+    // let time_zone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    // let timer = DebuggerTimer::new(time_zone);
+    //
+    // let state = AppState::new(args.wasm_path, timer.clone())?;
+    // let shared_state = Arc::clone(&state.shared_state);
+    //
+    // thread::Builder::new()
+    //     .name("Auto Splitter Thread".into())
+    //     .spawn({
+    //         let shared_state = shared_state.clone();
+    //         move || runtime_thread(shared_state, timer)
+    //     })
+    //     .unwrap();
 
     // let settings_map = self
     //     .state
@@ -65,7 +117,7 @@ fn main() -> Result<()> {
 }
 
 struct SharedState {
-    auto_splitter: AutoSplitter<DebuggerTimer>,
+    auto_splitter: AutoSplitter<WebsocketTimer>,
     tick_rate: Mutex<std::time::Duration>,
     memory_usage: AtomicUsize,
 }
@@ -79,8 +131,8 @@ impl SharedState {
     }
 
     fn try_lock(
-        auto_splitter: &AutoSplitter<DebuggerTimer>,
-    ) -> Option<ExecutionGuard<'_, DebuggerTimer>> {
+        auto_splitter: &AutoSplitter<WebsocketTimer>,
+    ) -> Option<ExecutionGuard<'_, WebsocketTimer>> {
         for _ in 0..100 {
             if let Some(guard) = auto_splitter.try_lock() {
                 return Some(guard);
@@ -92,7 +144,7 @@ impl SharedState {
     }
 }
 
-fn runtime_thread(shared_state: Arc<SharedState>, timer: DebuggerTimer) {
+fn runtime_thread(shared_state: Arc<SharedState>) {
     let mut next_tick = Instant::now();
     loop {
         let auto_splitter = &shared_state.auto_splitter;
@@ -147,7 +199,7 @@ struct AppState {
     module_modified_time: Option<SystemTime>,
     module: CompiledAutoSplitter,
     shared_state: Arc<SharedState>,
-    timer: DebuggerTimer,
+    // timer: DebuggerTimer,
     runtime: livesplit_auto_splitting::Runtime,
 }
 
@@ -156,7 +208,7 @@ enum Load {
 }
 
 impl AppState {
-    fn new(path: PathBuf, timer: DebuggerTimer) -> anyhow::Result<Self> {
+    fn new(path: PathBuf, timer: WebsocketTimer) -> anyhow::Result<Self> {
         // let optimize = !args.debug;
         // let mut state = AppState {
         //     path: None,
@@ -192,7 +244,7 @@ impl AppState {
         let module_modified_time = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
 
         let new_auto_splitter = module
-            .instantiate(timer.clone(), settings_map, None)
+            .instantiate(timer, settings_map, None)
             .context("Failed starting the auto splitter.")?;
 
         let shared_state = Arc::new(SharedState {
@@ -201,19 +253,19 @@ impl AppState {
             tick_rate: Mutex::new(std::time::Duration::ZERO),
         });
 
-        let mut inner_timer = timer.0.write().unwrap();
-        // if let Load::File(_) = &load {
-        inner_timer.clear();
-        // }
-        inner_timer.variables.clear();
-        drop(inner_timer);
+        // let mut inner_timer = timer.0.write().unwrap();
+        // // if let Load::File(_) = &load {
+        // inner_timer.clear();
+        // // }
+        // inner_timer.variables.clear();
+        // drop(inner_timer);
 
         Ok(AppState {
             path,
             module_modified_time,
             module,
             shared_state,
-            timer,
+            // timer,
             runtime,
         })
     }
@@ -318,6 +370,130 @@ impl GameTimeState {
             GameTimeState::Paused => "Paused",
             GameTimeState::Running => "Running",
         }
+    }
+}
+
+/// A WebSocket echo server
+fn wsmain() {
+    let server = TcpListener::bind("127.0.0.1:9001").unwrap();
+    for stream in server.incoming() {
+        std::thread::spawn(move || {
+            let mut websocket = tungstenite::accept(stream.unwrap()).unwrap();
+
+            websocket.send(Messages::get_current_state()).unwrap();
+
+            loop {
+                let msg = websocket.read().unwrap();
+                match msg {
+                    Message::Text(msg) => {
+                        // let msg =
+                        //     serde_json::from_str::<livesplit_core::event::Event>(msg.as_str())
+                        //         .unwrap();
+                        eprintln!("received: {:?}", msg.as_str());
+                    }
+                    Message::Binary(bytes) => todo!(),
+                    Message::Ping(bytes) => {
+                        websocket.send(Message::Pong(bytes)).unwrap();
+                    }
+                    Message::Pong(bytes) => todo!(),
+                    Message::Close(close_frame) => todo!(),
+                    Message::Frame(frame) => todo!(),
+                }
+            }
+        });
+    }
+}
+
+macro_rules! cmd {
+    ($command:literal) => {
+        Utf8Bytes::from_static(concat!("{\"command\":\"", $command, "\"}"))
+    };
+}
+
+struct Messages {}
+
+impl Messages {
+    const START: Utf8Bytes = cmd!("start");
+    const SPLIT: Utf8Bytes = cmd!("split");
+    const PING: Utf8Bytes = cmd!("ping");
+    const GET_CURRENT_STATE: Utf8Bytes = cmd!("getCurrentState");
+
+    fn start() -> Message {
+        Message::Text(Self::START)
+    }
+
+    fn split() -> Message {
+        Message::Text(Self::SPLIT)
+    }
+
+    fn ping() -> Message {
+        Message::Text(Self::PING)
+    }
+
+    fn get_current_state() -> Message {
+        Message::Text(Self::GET_CURRENT_STATE)
+    }
+
+    fn set_game_time(time: time::Duration) -> Message {
+        Message::text(format!(
+            "{{\"command\":\"setGameTime\",\"time\":\"{}\"}}",
+            time.whole_seconds()
+        ))
+    }
+}
+
+struct WebsocketTimer(WebSocket<TcpStream>);
+
+impl Timer for WebsocketTimer {
+    fn state(&self) -> TimerState {
+        // self.0.send(Messages::get_current_state()).unwrap();
+        // let res = self.0.read().unwrap();
+        // eprintln!("{:?}", res);
+        todo!()
+    }
+
+    fn start(&mut self) {
+        self.0.send(Messages::start()).unwrap();
+    }
+
+    fn split(&mut self) {
+        self.0.send(Messages::split()).unwrap();
+    }
+
+    fn skip_split(&mut self) {
+        todo!()
+    }
+
+    fn undo_split(&mut self) {
+        todo!()
+    }
+
+    fn reset(&mut self) {
+        todo!()
+    }
+
+    fn set_game_time(&mut self, time: time::Duration) {
+        self.0.send(Messages::set_game_time(time)).unwrap();
+    }
+
+    fn pause_game_time(&mut self) {
+        todo!()
+    }
+
+    fn resume_game_time(&mut self) {
+        todo!()
+    }
+
+    fn set_variable(&mut self, key: &str, value: &str) {
+        todo!()
+    }
+
+    fn log_auto_splitter(&mut self, message: std::fmt::Arguments<'_>) {
+        todo!()
+    }
+
+    fn log_runtime(&mut self, message: std::fmt::Arguments<'_>, log_level: LogLevel) {
+        todo!()
     }
 }
 
