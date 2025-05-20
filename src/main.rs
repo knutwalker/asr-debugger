@@ -22,10 +22,22 @@ use livesplit_auto_splitting::{
 use time::UtcOffset;
 use tungstenite::{Message, Utf8Bytes, WebSocket};
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
+#[command(about, long_about = None, arg_required_else_help(true))]
 struct Args {
+    /// Path to a settings file for the autosplitter (toml)
     #[arg(short, long)]
-    debug: bool,
+    settings: Option<PathBuf>,
+
+    /// Websocket port
+    #[arg(short, long, default_value_t = 9087)]
+    port: u16,
+
+    /// Websocket host
+    #[arg(short = 'H', long, default_value = "0.0.0.0")]
+    host: IpAddr,
+
+    /// Path to the autosplitter wasm file
     wasm_path: PathBuf,
 }
 

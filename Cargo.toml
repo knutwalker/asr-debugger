@@ -1,15 +1,16 @@
 [package]
-name = "asr-debugger"
+name = "asr-lso"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "AutoSplitter Runtime bridge for LiveSplit one"
 
 [dependencies]
 anyhow = "1.0.75"
 clap = { version = "4.4.6", default-features = false, features = [
     "derive",
+    "help",
     "std",
+    "usage",
 ] }
 indexmap = "2.0.0"
 livesplit-core = { git = "https://github.com/LiveSplit/livesplit-core", default-features = false, features = [
