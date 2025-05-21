@@ -1,4 +1,3 @@
-
 use std::{
     fs,
     net::{IpAddr, TcpListener, TcpStream},
@@ -160,7 +159,7 @@ impl WsThread {
 
     fn run(mut self) {
         loop {
-            let cb = match self.rx.recv_timeout(Duration::from_secs(1)) {
+            let cb = match self.rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(cmd) => self.handle(cmd),
                 Err(mpsc::RecvTimeoutError::Timeout) => self.read(),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -206,6 +205,9 @@ impl WsThread {
     fn read(&mut self) -> ControlFlow<()> {
         let msg = match self.ws.read() {
             Ok(msg) => msg,
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return ControlFlow::Continue(())
+            }
             Err(e) => {
                 error!("Websocket Read Error: {e:?}");
                 return ControlFlow::Break(());
