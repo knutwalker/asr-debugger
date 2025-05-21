@@ -10,7 +10,7 @@ use std::{
         Arc, RwLock,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -160,12 +160,19 @@ impl WsThread {
 
     fn run(mut self) {
         loop {
-            let Ok(cmd) = self.rx.recv() else { break };
+            let cb = match self.rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(cmd) => self.handle(cmd),
+                Err(mpsc::RecvTimeoutError::Timeout) => self.read(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    info!("Sender disconnected");
+                    ControlFlow::Break(())
+                }
+            };
 
-            match self.handle(cmd) {
+            match cb {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(()) => break,
-            }
+            };
         }
     }
 
@@ -193,6 +200,10 @@ impl WsThread {
             WsCommand::GetCurrentState => send!(Self::GET_CURRENT_STATE),
         }
 
+        self.read()
+    }
+
+    fn read(&mut self) -> ControlFlow<()> {
         let msg = match self.ws.read() {
             Ok(msg) => msg,
             Err(e) => {
