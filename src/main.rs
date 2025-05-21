@@ -5,6 +5,7 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, RwLock,
     },
@@ -57,18 +58,23 @@ fn main() -> Result<()> {
         let timer_state = Arc::new(RwLock::new(TimerState::NotRunning));
 
         let (mut ws, tx) = WsThread::new(ws, Arc::clone(&timer_state));
-        let _ = ws.handle(WsCommand::GetCurrentState(TimerState::NotRunning));
+        let _ = ws.handle(WsCommand::GetCurrentState);
 
-        let timer_state = CurrentTimerState::new(timer_state);
-        let timer = WebsocketTimer::new(timer_state, tx);
-        let state = SplitterThread::new(&args.wasm_path, args.settings.as_deref(), timer)?;
+        let shared_state = SharedState::new(timer_state);
+        let timer = WebsocketTimer::new(shared_state.clone(), tx);
+        let state = SplitterThread::new(
+            &args.wasm_path,
+            args.settings.as_deref(),
+            timer,
+            shared_state,
+        )?;
 
-        let ws = thread::Builder::new()
+        thread::Builder::new()
             .name(format!("Websocket Handler {counter}"))
             .spawn(move || ws.run())
             .unwrap();
 
-        let state = thread::Builder::new()
+        thread::Builder::new()
             .name(format!("Auto Splitter Runtime {counter}"))
             .spawn(move || state.run())
             .unwrap();
@@ -90,17 +96,11 @@ enum WsCommand {
     Reset,
     UndoSplit,
     SkipSplit,
-    SetGameTime {
-        time: time::Duration,
-    },
+    SetGameTime(time::Duration),
     PauseGameTime,
     ResumeGameTime,
-    SetCustomVariable {
-        key: Box<str>,
-        value: Box<str>,
-    },
-    Ping,
-    GetCurrentState(TimerState),
+    SetCustomVariable(Box<str>, Box<str>),
+    GetCurrentState,
 }
 
 macro_rules! cmd {
@@ -137,7 +137,6 @@ impl WsThread {
     const PAUSE_GAME_TIME: Message = cmd!("pauseGameTime");
     const RESUME_GAME_TIME: Message = cmd!("resumeGameTime");
     const GET_CURRENT_STATE: Message = cmd!("getCurrentState");
-    const PING: Message = cmd!("ping");
 
     fn set_game_time(time: time::Duration) -> Message {
         Message::text(format!(
@@ -185,14 +184,13 @@ impl WsThread {
             WsCommand::Reset => send!(Self::RESET),
             WsCommand::UndoSplit => send!(Self::UNDO_SPLIT),
             WsCommand::SkipSplit => send!(Self::SKIP_SPLIT),
-            WsCommand::SetGameTime { time } => send!(Self::set_game_time(*time)),
+            WsCommand::SetGameTime(time) => send!(Self::set_game_time(*time)),
             WsCommand::PauseGameTime => send!(Self::PAUSE_GAME_TIME),
             WsCommand::ResumeGameTime => send!(Self::RESUME_GAME_TIME),
-            WsCommand::SetCustomVariable { key, value } => {
+            WsCommand::SetCustomVariable(key, value) => {
                 send!(Self::set_custom_variable(key, value))
             }
-            WsCommand::Ping => send!(Self::PING),
-            WsCommand::GetCurrentState(_) => send!(Self::GET_CURRENT_STATE),
+            WsCommand::GetCurrentState => send!(Self::GET_CURRENT_STATE),
         }
 
         let msg = match self.ws.read() {
@@ -204,10 +202,19 @@ impl WsThread {
         };
         trace!("Websocket message: {msg:?}");
 
-        let Ok(msg) = msg.to_text() else {
-            error!("Not a test message: {msg:?}");
-            return ControlFlow::Break(());
+        let msg = match msg {
+            Message::Text(ref utf8_bytes) => utf8_bytes.as_str(),
+            Message::Binary(ref bytes) => std::str::from_utf8(bytes).unwrap(),
+            Message::Close(_) => {
+                info!("Other side hang up, stopping");
+                return ControlFlow::Break(());
+            }
+            otherwise => {
+                error!("Not a text message: {otherwise:?}");
+                return ControlFlow::Break(());
+            }
         };
+
         let msg = match Self::parse_response(msg) {
             Ok(msg) => msg,
             Err(e) => {
@@ -372,26 +379,44 @@ pub enum Event {
 }
 
 #[derive(Debug, Clone)]
-struct CurrentTimerState {
+struct SharedState {
     state: Arc<RwLock<TimerState>>,
+    alive: Arc<AtomicBool>,
 }
 
-impl CurrentTimerState {
+impl SharedState {
     fn new(state: Arc<RwLock<TimerState>>) -> Self {
-        Self { state }
+        Self {
+            state,
+            alive: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     fn state(&self) -> TimerState {
         *self.state.read().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    fn deadge(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+    }
 }
 
 struct SplitterThread {
     splitter: AutoSplitter<WebsocketTimer>,
+    state: SharedState,
 }
 
 impl SplitterThread {
-    fn new(path: &Path, settings: Option<&Path>, timer: WebsocketTimer) -> anyhow::Result<Self> {
+    fn new(
+        path: &Path,
+        settings: Option<&Path>,
+        timer: WebsocketTimer,
+        state: SharedState,
+    ) -> anyhow::Result<Self> {
         let module =
             fs::read(path).context("Failed loading the auto splitter from the file system.")?;
 
@@ -416,7 +441,7 @@ impl SplitterThread {
             .instantiate(timer, Some(settings_map), None)
             .context("Failed starting the auto splitter.")?;
 
-        Ok(SplitterThread { splitter })
+        Ok(SplitterThread { splitter, state })
     }
 
     fn load_settings(file: &Path, settings_map: &mut settings::Map) -> anyhow::Result<()> {
@@ -453,6 +478,10 @@ impl SplitterThread {
                 error!("{:?}", e.context("Failed executing the auto splitter."));
             };
 
+            if !self.state.alive() {
+                break;
+            }
+
             let tick_rate = auto_splitter.tick_rate();
             next_tick += tick_rate;
 
@@ -471,25 +500,26 @@ impl SplitterThread {
 }
 
 struct WebsocketTimer {
-    timer_state: CurrentTimerState,
+    state: SharedState,
     rx: Sender<WsCommand>,
 }
 
 impl WebsocketTimer {
-    fn new(timer_state: CurrentTimerState, rx: Sender<WsCommand>) -> Self {
-        Self { timer_state, rx }
+    fn new(state: SharedState, rx: Sender<WsCommand>) -> Self {
+        Self { state, rx }
     }
 
     fn send(&self, cmd: WsCommand) {
         if let Err(e) = self.rx.send(cmd) {
             error!("Could not send command to the websocket: {e:?}");
+            self.state.deadge();
         }
     }
 }
 
 impl Timer for WebsocketTimer {
     fn state(&self) -> TimerState {
-        self.timer_state.state()
+        self.state.state()
     }
 
     fn start(&mut self) {
@@ -519,7 +549,7 @@ impl Timer for WebsocketTimer {
 
     fn set_game_time(&mut self, time: time::Duration) {
         trace!("Set game time to {time:?}");
-        self.send(WsCommand::SetGameTime { time });
+        self.send(WsCommand::SetGameTime(time));
     }
 
     fn pause_game_time(&mut self) {
@@ -534,10 +564,7 @@ impl Timer for WebsocketTimer {
 
     fn set_variable(&mut self, key: &str, value: &str) {
         trace!("Set variable {key} = {value}");
-        self.send(WsCommand::SetCustomVariable {
-            key: key.into(),
-            value: value.into(),
-        });
+        self.send(WsCommand::SetCustomVariable(key.into(), value.into()));
     }
 
     fn log_auto_splitter(&mut self, message: std::fmt::Arguments<'_>) {
