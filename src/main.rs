@@ -1,4 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use std::{
     fs,
@@ -10,7 +9,7 @@ use std::{
         Arc, RwLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -18,7 +17,6 @@ use clap::Parser;
 use livesplit_auto_splitting::{
     settings, time, AutoSplitter, Config, LogLevel, Runtime, Timer, TimerState,
 };
-use livesplit_core::event;
 use log::{debug, error, info, trace};
 use tungstenite::{Message, Utf8Bytes, WebSocket};
 
@@ -61,14 +59,9 @@ fn main() -> Result<()> {
         let (mut ws, tx) = WsThread::new(ws, Arc::clone(&timer_state));
         let _ = ws.handle(WsCommand::GetCurrentState(TimerState::NotRunning));
 
-        let timer_state = CurrentTimerState::new(tx.clone(), timer_state);
-        let timer = WebsocketTimer::new(timer_state.clone(), tx);
-        let state = SplitterThread::new(
-            &args.wasm_path,
-            args.settings.as_deref(),
-            timer,
-            timer_state,
-        )?;
+        let timer_state = CurrentTimerState::new(timer_state);
+        let timer = WebsocketTimer::new(timer_state, tx);
+        let state = SplitterThread::new(&args.wasm_path, args.settings.as_deref(), timer)?;
 
         let ws = thread::Builder::new()
             .name(format!("Websocket Handler {counter}"))
@@ -166,22 +159,6 @@ impl WsThread {
         Ok(response)
     }
 
-    fn parse_state(res: CommandResult) -> Result<TimerState> {
-        let state = match res {
-            CommandResult::Success(Response::State(state)) => state,
-            CommandResult::Success(success) => anyhow::bail!("Expected state, got {success:?}"),
-            CommandResult::Error(error) => anyhow::bail!(format!("{error:?}")),
-        };
-        trace!("Current timer state: {state:?}");
-        let state = match state {
-            State::NotRunning => TimerState::NotRunning,
-            State::Running(_) => TimerState::Running,
-            State::Paused(_) => TimerState::Paused,
-            State::Ended => TimerState::Ended,
-        };
-        Ok(state)
-    }
-
     fn run(mut self) {
         loop {
             let Ok(cmd) = self.rx.recv() else { break };
@@ -225,33 +202,41 @@ impl WsThread {
                 return ControlFlow::Break(());
             }
         };
+        trace!("Websocket message: {msg:?}");
 
-        debug!("Websocket message: {msg:?}");
-
-        if let WsCommand::GetCurrentState(before) = cmd {
-            let Ok(msg) = msg.to_text() else {
-                error!("Not a test message: {msg:?}");
-                return ControlFlow::Break(());
-            };
-            let msg = match Self::parse_response(msg) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!("Websocket Parse Error: {e:?}");
-                    return ControlFlow::Continue(());
-                }
-            };
-            let state = match Self::parse_state(msg) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!("Response Parse Error: {e:?}");
-                    return ControlFlow::Continue(());
-                }
-            };
-
-            if state != before {
-                let mut guard = self.timer_state.write().unwrap_or_else(|e| e.into_inner());
-                *guard = state;
+        let Ok(msg) = msg.to_text() else {
+            error!("Not a test message: {msg:?}");
+            return ControlFlow::Break(());
+        };
+        let msg = match Self::parse_response(msg) {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("Websocket Parse Error: {e:?}");
+                return ControlFlow::Continue(());
             }
+        };
+        trace!("Websocket message parsed: {msg:?}");
+
+        let state = match msg {
+            CommandResult::Success(Response::State(state)) => Some(match state {
+                State::NotRunning => TimerState::NotRunning,
+                State::Running(_) => TimerState::Running,
+                State::Paused(_) => TimerState::Paused,
+                State::Ended => TimerState::Ended,
+            }),
+            CommandResult::Event(Event::Started) => Some(TimerState::Running),
+            CommandResult::Event(Event::Paused) => Some(TimerState::Paused),
+            CommandResult::Event(Event::Resumed) => Some(TimerState::Running),
+            CommandResult::Event(Event::Finished) => Some(TimerState::Ended),
+            CommandResult::Event(Event::Reset) => Some(TimerState::NotRunning),
+            CommandResult::Success(_) | CommandResult::Event(_) | CommandResult::Error(_) => None,
+        };
+
+        debug!("Chaning timer state to {state:?}");
+
+        if let Some(state) = state {
+            let mut guard = self.timer_state.write().unwrap_or_else(|e| e.into_inner());
+            *guard = state;
         }
 
         ControlFlow::Continue(())
@@ -260,13 +245,25 @@ impl WsThread {
 
 #[derive(Debug, serde_derive::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 enum CommandResult {
     Success(Response),
     Error(Error),
+    Event(Event),
+}
+
+#[derive(Debug, serde_derive::Deserialize)]
+#[serde(untagged)]
+#[allow(unused)]
+enum Response {
+    None,
+    String(String),
+    State(State),
 }
 
 #[derive(Debug, serde_derive::Deserialize)]
 #[serde(tag = "state", content = "index")]
+#[allow(unused)]
 enum State {
     NotRunning,
     Running(usize),
@@ -275,15 +272,8 @@ enum State {
 }
 
 #[derive(Debug, serde_derive::Deserialize)]
-#[serde(untagged)]
-enum Response {
-    None,
-    String(String),
-    State(State),
-}
-
-#[derive(Debug, serde_derive::Deserialize)]
 #[serde(tag = "code")]
+#[allow(unused)]
 enum Error {
     InvalidCommand {
         message: String,
@@ -291,48 +281,117 @@ enum Error {
     InvalidIndex,
     #[serde(untagged)]
     Timer {
-        code: event::Error,
+        code: EventError,
     },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde_derive::Deserialize)]
+enum EventError {
+    /// The operation is not supported.
+    Unsupported = 0,
+    /// The timer can't be interacted with at the moment.
+    Busy = 1,
+    /// There is already a run in progress.
+    RunAlreadyInProgress = 2,
+    /// There is no run in progress.
+    NoRunInProgress = 3,
+    /// The run is already finished.
+    RunFinished = 4,
+    /// The time is negative, you can't split yet.
+    NegativeTime = 5,
+    /// The last split can't be skipped.
+    CantSkipLastSplit = 6,
+    /// There is no split to undo.
+    CantUndoFirstSplit = 7,
+    /// The timer is already paused.
+    AlreadyPaused = 8,
+    /// The timer is not paused.
+    NotPaused = 9,
+    /// The requested comparison doesn't exist.
+    ComparisonDoesntExist = 10,
+    /// The game time is already initialized.
+    GameTimeAlreadyInitialized = 11,
+    /// The game time is already paused.
+    GameTimeAlreadyPaused = 12,
+    /// The game time is not paused.
+    GameTimeNotPaused = 13,
+    /// The time could not be parsed.
+    CouldNotParseTime = 14,
+    /// The timer is currently paused.
+    TimerPaused = 15,
+    /// The runner decided to not reset the run.
+    RunnerDecidedAgainstReset = 16,
+    /// An unknown error occurred.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde_derive::Deserialize)]
+pub enum Event {
+    /// The timer has been started.
+    Started = 0,
+    /// A split happened. Note that the final split is signaled by
+    /// [`Finished`].
+    Splitted = 1,
+    /// The final split happened, the run is now finished, but has not been
+    /// reset yet.
+    Finished = 2,
+    /// The timer has been reset.
+    Reset = 3,
+    /// The previous split has been undone.
+    SplitUndone = 4,
+    /// The current split has been skipped.
+    SplitSkipped = 5,
+    /// The timer has been paused.
+    Paused = 6,
+    /// The timer has been resumed.
+    Resumed = 7,
+    /// All the pauses have been undone.
+    PausesUndone = 8,
+    /// All the pauses have been undone and the timer has been resumed.
+    PausesUndoneAndResumed = 9,
+    /// The comparison has been changed.
+    ComparisonChanged = 10,
+    /// The timing method has been changed.
+    TimingMethodChanged = 11,
+    /// The game time has been initialized.
+    GameTimeInitialized = 12,
+    /// The game time has been set.
+    GameTimeSet = 13,
+    /// The game time has been paused.
+    GameTimePaused = 14,
+    /// The game time has been resumed.
+    GameTimeResumed = 15,
+    /// The loading times have been set.
+    LoadingTimesSet = 16,
+    /// A custom variable has been set.
+    CustomVariableSet = 17,
+    /// An unknown event occurred.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
 struct CurrentTimerState {
-    tx: Sender<WsCommand>,
     state: Arc<RwLock<TimerState>>,
 }
 
 impl CurrentTimerState {
-    fn new(tx: Sender<WsCommand>, state: Arc<RwLock<TimerState>>) -> Self {
-        Self { tx, state }
+    fn new(state: Arc<RwLock<TimerState>>) -> Self {
+        Self { state }
     }
 
     fn state(&self) -> TimerState {
         *self.state.read().unwrap_or_else(|e| e.into_inner())
     }
-
-    fn refresh_state(&self) {
-        self.send(WsCommand::GetCurrentState(self.state()));
-    }
-
-    fn send(&self, cmd: WsCommand) {
-        if let Err(e) = self.tx.send(cmd) {
-            error!("Could not send command to the websocket: {e:?}");
-        }
-    }
 }
 
 struct SplitterThread {
     splitter: AutoSplitter<WebsocketTimer>,
-    timer_state: CurrentTimerState,
 }
 
 impl SplitterThread {
-    fn new(
-        path: &Path,
-        settings: Option<&Path>,
-        timer: WebsocketTimer,
-        timer_state: CurrentTimerState,
-    ) -> anyhow::Result<Self> {
+    fn new(path: &Path, settings: Option<&Path>, timer: WebsocketTimer) -> anyhow::Result<Self> {
         let module =
             fs::read(path).context("Failed loading the auto splitter from the file system.")?;
 
@@ -357,10 +416,7 @@ impl SplitterThread {
             .instantiate(timer, Some(settings_map), None)
             .context("Failed starting the auto splitter.")?;
 
-        Ok(SplitterThread {
-            splitter,
-            timer_state,
-        })
+        Ok(SplitterThread { splitter })
     }
 
     fn load_settings(file: &Path, settings_map: &mut settings::Map) -> anyhow::Result<()> {
@@ -384,7 +440,6 @@ impl SplitterThread {
 
     fn run(self) {
         let mut next_tick = Instant::now();
-        let mut last_state_check = next_tick - Duration::from_secs(1);
 
         loop {
             let auto_splitter = &self.splitter;
@@ -401,15 +456,7 @@ impl SplitterThread {
             let tick_rate = auto_splitter.tick_rate();
             next_tick += tick_rate;
 
-            let mut now = Instant::now();
-            if next_tick.checked_duration_since(now).is_some()
-                && now.saturating_duration_since(last_state_check) > Duration::from_secs(1)
-            {
-                self.timer_state.refresh_state();
-                now = Instant::now();
-                last_state_check = now;
-            }
-
+            let now = Instant::now();
             if let Some(sleep_time) = next_tick.checked_duration_since(now) {
                 thread::sleep(sleep_time);
             } else {
