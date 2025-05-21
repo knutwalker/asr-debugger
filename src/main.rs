@@ -40,7 +40,10 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    pretty_env_logger::init();
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe { std::env::set_var("RUST_LOG", "info") };
+    }
+    pretty_env_logger::init_timed();
 
     let args = Args::parse();
     debug!("Args: {:?}", args);
@@ -253,7 +256,7 @@ impl WsThread {
         };
 
         if let Some(state) = state {
-            debug!("Changing timer state to {state:?}");
+            info!("Changing timer state to {state:?}");
             let mut guard = self.timer_state.write().unwrap_or_else(|e| e.into_inner());
             *guard = state;
         }
@@ -580,7 +583,7 @@ impl Timer for WebsocketTimer {
     }
 
     fn log_auto_splitter(&mut self, message: std::fmt::Arguments<'_>) {
-        eprintln!("{message}");
+        info!("Autosplitter: {message}");
     }
 
     fn log_runtime(&mut self, message: std::fmt::Arguments<'_>, log_level: LogLevel) {
