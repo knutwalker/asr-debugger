@@ -51,8 +51,8 @@ fn main() -> Result<()> {
 
     for (counter, stream) in server.incoming().enumerate() {
         let stream = stream?;
-
         info!("Accepting connection from {:?}", stream.peer_addr());
+        stream.set_nonblocking(true)?;
         let ws = tungstenite::accept(stream)?;
 
         let timer_state = Arc::new(RwLock::new(TimerState::NotRunning));
@@ -250,9 +250,8 @@ impl WsThread {
             CommandResult::Success(_) | CommandResult::Event(_) | CommandResult::Error(_) => None,
         };
 
-        debug!("Chaning timer state to {state:?}");
-
         if let Some(state) = state {
+            debug!("Changing timer state to {state:?}");
             let mut guard = self.timer_state.write().unwrap_or_else(|e| e.into_inner());
             *guard = state;
         }
