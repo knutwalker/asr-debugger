@@ -52,8 +52,8 @@ fn main() -> Result<()> {
     for (counter, stream) in server.incoming().enumerate() {
         let stream = stream?;
         info!("Accepting connection from {:?}", stream.peer_addr());
-        stream.set_nonblocking(true)?;
         let ws = tungstenite::accept(stream)?;
+        ws.get_ref().set_nonblocking(true)?;
 
         let timer_state = Arc::new(RwLock::new(TimerState::NotRunning));
 
