@@ -259,6 +259,7 @@ impl WsThread {
 }
 
 #[derive(Debug, serde_derive::Deserialize)]
+#[serde(rename_all = "camelCase")]
 enum CommandResult {
     Success(Response),
     Error(Error),
